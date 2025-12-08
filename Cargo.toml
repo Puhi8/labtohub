@@ -1,0 +1,8 @@
+[package]
+name = "labtohub"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dialoguer = "0.11"
+anyhow = "1.0"
