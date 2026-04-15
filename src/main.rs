@@ -20,18 +20,18 @@ fn run(cmd: &str, args: &[&str]) -> Result<()> {
    Ok(())
 }
 
+fn run_git_in(path: &str, args: &[&str]) -> Result<()> {
+   let mut full = vec!["-C", path];
+   full.extend_from_slice(args);
+   run("git", &full)
+}
+
 fn run_output(cmd: &str, args: &[&str]) -> Result<String> {
    let output = Command::new(cmd).args(args).output()?;
    if !output.status.success() {
       bail!("Command failed: {} {:?}", cmd, args);
    }
    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn run_git_in(path: &str, args: &[&str]) -> Result<()> {
-   let mut full = vec!["-C", path];
-   full.extend_from_slice(args);
-   run("git", &full)
 }
 
 fn branch_name_from_message(message: &str) -> String {
@@ -57,6 +57,47 @@ fn branch_name_from_message(message: &str) -> String {
    }
 }
 
+fn message_from_args(argv: &[String]) -> Option<String> {
+   match argv {
+      [] => None,
+      [flag] if flag == "-m" || flag == "--message" => None,
+      [flag, message, ..] if flag == "-m" || flag == "--message" => Some(message.clone()),
+      _ => Some(argv.join(" ")),
+   }
+}
+
+fn uncommitted_changes() -> Result<Vec<String>> {
+   let output = run_output("git", &["status", "--porcelain"])?;
+   Ok(output
+      .lines()
+      .filter(|line| !line.trim().is_empty())
+      .map(|line| line.to_string())
+      .collect())
+}
+
+fn confirm_uncommitted_changes() -> Result<()> {
+   let changes = uncommitted_changes()?;
+   if changes.is_empty() {
+      return Ok(());
+   }
+
+   println!("Warning: your current working tree has uncommitted files:");
+   for change in changes {
+      println!("  {}", change);
+   }
+   println!("Only commits already on origin/main will be copied to github/main.");
+
+   if !Confirm::new()
+      .with_prompt("Continue even though these local files are not committed?")
+      .default(false)
+      .interact()?
+   {
+      bail!("Aborted due to uncommitted files");
+   }
+
+   Ok(())
+}
+
 fn fetch_remotes() -> Result<()> {
    println!("Fetching github/main and origin/main...");
    run("git", &["fetch", "github", "main"])?;
@@ -65,7 +106,11 @@ fn fetch_remotes() -> Result<()> {
 }
 
 fn remove_existing_worktree() -> Result<()> {
-   let _ = run("git", &["worktree", "remove", "--force", TMP_WORKTREE]);
+   let _ = Command::new("git")
+      .args(&["worktree", "remove", "--force", TMP_WORKTREE])
+      .stdout(Stdio::null())
+      .stderr(Stdio::null())
+      .status();
    let _ = fs::remove_dir_all(TMP_WORKTREE);
    Ok(())
 }
@@ -119,10 +164,13 @@ fn commit_worktree(message: &str) -> Result<bool> {
    Ok(true)
 }
 
-fn merge_into_main(branch: &str, message: &str) -> Result<()> {
-   println!("Merging '{}' into staging main branch...", branch);
+fn merge_into_main(branch: &str) -> Result<()> {
+   println!(
+      "Fast-forwarding '{}' into staging main branch...",
+      branch
+   );
    run_git_in(TMP_WORKTREE, &["switch", MAIN_STAGING_BRANCH])?;
-   run_git_in(TMP_WORKTREE, &["merge", "--no-ff", branch, "-m", message])?;
+   run_git_in(TMP_WORKTREE, &["merge", "--ff-only", branch])?;
    Ok(())
 }
 
@@ -163,12 +211,8 @@ impl Drop for Cleanup {
 fn main() -> Result<()> {
    let mut cleanup = Cleanup::new();
 
-   let mut argv = args().skip(1).collect::<Vec<_>>();
-   let mut message = String::new();
-   if argv.len() >= 2 && argv[0] == "-m" {
-      message = argv[1].clone();
-      argv.drain(0..2);
-   }
+   let argv = args().skip(1).collect::<Vec<_>>();
+   let mut message = message_from_args(&argv).unwrap_or_default();
    if message.is_empty() {
       message = Input::new()
          .with_prompt("Enter merge message")
@@ -178,6 +222,8 @@ fn main() -> Result<()> {
 
    println!("Branch to create: '{}'", branch);
    println!("Merge message: \"{}\"", message);
+   confirm_uncommitted_changes()?;
+
    if !Confirm::new()
       .with_prompt("Proceed? Uses a temporary worktree; your current files stay untouched.")
       .default(false)
@@ -199,7 +245,7 @@ fn main() -> Result<()> {
       return Ok(());
    }
 
-   merge_into_main(&branch, &message)?;
+   merge_into_main(&branch)?;
    push_to_github_main()?;
 
    println!(
